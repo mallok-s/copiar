@@ -174,7 +174,7 @@ def ensure_repo_exists(username: str, token: str, repo_name: str) -> tuple[str, 
             headers=headers,
             json={
                 "name": repo_name,
-                "private": False,
+                "private": True,
                 "description": "GitHub contribution mirror",
                 "auto_init": False,
             },
