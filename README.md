@@ -17,7 +17,7 @@ All operations are **idempotent** — re-running never creates duplicate commits
 
 Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**
 
-Required scopes: `repo`, `read:user`
+Required scopes: `repo`, `read:user`, `delete_repo` (only needed for `--reset-repo`)
 
 ### 2. Configure the Actions workflow
 
@@ -44,6 +44,9 @@ uv run copiar.py --dry-run --backfill
 # full backfill
 uv run copiar.py --yes --backfill
 
+# wipe and recreate the mirror repo (e.g. to fix wrong-author commits)
+uv run copiar.py --reset-repo --yes --backfill
+
 # sync a specific date range
 uv run copiar.py --yes --start 2025-01-01 --end 2025-03-31
 ```
@@ -60,6 +63,7 @@ uv run copiar.py --yes --start 2025-01-01 --end 2025-03-31
 | `--keep-repo` | Don't delete the temp clone after push |
 | `--local-dir PATH` | Use a specific directory instead of a temp dir |
 | `--env PATH` | Path to an alternate `.env` file |
+| `--reset-repo` | Delete and recreate the mirror repo before running (requires `delete_repo` token scope) |
 
 ## Automation
 
