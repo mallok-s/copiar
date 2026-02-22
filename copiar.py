@@ -28,6 +28,13 @@ from dotenv import load_dotenv
 
 ContributionMap: TypeAlias = dict[str, int]
 
+
+@dataclass
+class GitIdentity:
+    name: str
+    email: str
+
+
 GITHUB_API = "https://api.github.com"
 GITHUB_GRAPHQL = "https://api.github.com/graphql"
 
@@ -49,6 +56,7 @@ class Config:
     yes: bool
     keep_repo: bool
     backfill: bool
+    reset_repo: bool
 
 
 # ---------------------------------------------------------------------------
@@ -79,10 +87,10 @@ def run_git(
     return result.stdout
 
 
-def configure_git(repo_dir: Path) -> None:
+def configure_git(repo_dir: Path, name: str, email: str) -> None:
     """Set local git user.name and user.email (required in CI)."""
-    run_git(["config", "user.name", "copiar"], cwd=repo_dir)
-    run_git(["config", "user.email", "copiar@users.noreply.github.com"], cwd=repo_dir)
+    run_git(["config", "user.name", name], cwd=repo_dir)
+    run_git(["config", "user.email", email], cwd=repo_dir)
 
 
 def load_existing_commits(repo_dir: Path) -> ContributionMap:
@@ -142,6 +150,28 @@ def push_to_remote(repo_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 # Repo management
 # ---------------------------------------------------------------------------
+
+
+def delete_repo(username: str, token: str, repo_name: str) -> None:
+    """Delete the GitHub repo via REST API. No-op if repo doesn't exist."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    resp = requests.delete(
+        f"{GITHUB_API}/repos/{username}/{repo_name}",
+        headers=headers,
+        timeout=30,
+    )
+    if resp.status_code == 404:
+        return  # already gone
+    if resp.status_code not in (200, 204):
+        print(
+            f"Error deleting repo: {resp.status_code} {resp.text}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def ensure_repo_exists(username: str, token: str, repo_name: str) -> tuple[str, bool]:
@@ -227,6 +257,7 @@ def prepare_local_repo(
     username: str,
     repo_name: str,
     token: str,
+    identity: GitIdentity,
 ) -> Path:
     """Clone if remote has history, else init fresh. Always configures git."""
     if local_dir is not None:
@@ -245,7 +276,7 @@ def prepare_local_repo(
             # Already a git repo — pull latest
             if repo_has_commits or _repo_has_remote_commits(username, repo_name, token):
                 run_git(["pull", "--rebase", "origin"], cwd=repo_dir)
-            configure_git(repo_dir)
+            configure_git(repo_dir, identity.name, identity.email)
             return repo_dir
         # Not yet a git repo in this dir
     else:
@@ -268,7 +299,7 @@ def prepare_local_repo(
         run_git(["init", "-b", "main"], cwd=repo_dir)
         run_git(["remote", "add", "origin", remote_url], cwd=repo_dir)
 
-    configure_git(repo_dir)
+    configure_git(repo_dir, identity.name, identity.email)
     return repo_dir
 
 
@@ -323,6 +354,29 @@ def fetch_user_created_at(username: str, token: str) -> date:
         sys.exit(1)
     created_at_str: str = user["createdAt"]
     return date.fromisoformat(created_at_str[:10])
+
+
+def fetch_personal_user_info(token: str) -> GitIdentity:
+    """Fetch the personal account's display name and noreply email."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    resp = requests.get(f"{GITHUB_API}/user", headers=headers, timeout=30)
+    if resp.status_code == 401:
+        print(
+            "Error: personal token returned 401. Check PERSONAL_GITHUB_TOKEN scopes.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    resp.raise_for_status()
+    data = resp.json()
+    user_id: int = data["id"]
+    login: str = data["login"]
+    name: str = data.get("name") or login
+    email = f"{user_id}+{login}@users.noreply.github.com"
+    return GitIdentity(name=name, email=email)
 
 
 def _fetch_contributions_chunk(
@@ -440,6 +494,15 @@ def parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="Path to alternate .env file",
     )
+    parser.add_argument(
+        "--reset-repo",
+        action="store_true",
+        help=(
+            "Delete and recreate the mirror repo before running "
+            "(clears wrong-author history). "
+            "Requires 'delete_repo' scope on personal token."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -499,6 +562,7 @@ def load_config(args: argparse.Namespace) -> Config:
         yes=args.yes,
         keep_repo=args.keep_repo,
         backfill=args.backfill,
+        reset_repo=args.reset_repo,
     )
 
 
@@ -530,6 +594,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             yes=config.yes,
             keep_repo=config.keep_repo,
             backfill=config.backfill,
+            reset_repo=config.reset_repo,
         )
         print(f"Backfill start: {config.start_date}")
 
@@ -564,6 +629,27 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
         )
         return
 
+    # --reset-repo: delete GitHub repo + local clone, then recreate fresh
+    if config.reset_repo:
+        print(
+            f"WARNING: --reset-repo will permanently delete '{config.target_repo}' "
+            f"and all its history."
+        )
+        if not config.yes:
+            confirm = input("Type 'yes' to confirm: ").strip().lower()
+            if confirm != "yes":
+                print("Aborted.")
+                return
+        print(f"Deleting repo '{config.target_repo}'...")
+        delete_repo(config.personal_username, config.personal_token, config.target_repo)
+        if config.local_dir is not None and config.local_dir.exists():
+            shutil.rmtree(config.local_dir)
+            print(f"Deleted local clone at '{config.local_dir}'.")
+
+    # Fetch personal user identity for git authorship
+    identity = fetch_personal_user_info(config.personal_token)
+    print(f"Commit author: {identity.name} <{identity.email}>")
+
     # Ensure mirror repo exists
     print(f"Checking mirror repo '{config.target_repo}'...")
     remote_url, repo_has_commits = ensure_repo_exists(
@@ -583,6 +669,7 @@ def main() -> None:  # noqa: C901, PLR0912, PLR0915
             config.personal_username,
             config.target_repo,
             config.personal_token,
+            identity,
         )
         if config.local_dir is None:
             temp_dir = repo_dir
